@@ -6,6 +6,7 @@ from .records import  ResultT, StepT
 class AbstractAgent(ABC):
     @abstractmethod
     def run(self, task: str, log: Callable[[StepT], None]) -> ResultT:
-        pass
+        raise NotImplementedError("Subclasses must implement this method")
+
 
 
