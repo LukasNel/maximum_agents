@@ -5,8 +5,8 @@ import duckdb
 import os
 import glob
 from pathlib import Path
-from .types import ParcelT, AccessControlT, SettingsT
-
+from .types import ParcelT, AccessControlT, SettingsT, TableInfoT
+import json
 
 class Backend(ABC):
     def __init__(self, settings: SettingsT, api_key: Optional[str] = None):
@@ -46,6 +46,10 @@ class Backend(ABC):
         pass
     
     @abstractmethod
+    def get_table_info(self, database_id: str, table_name: str) -> Optional[TableInfoT]:
+        pass
+    
+    @abstractmethod
     def add_row(self, database_id: str, table_name: str, row_data: Dict[str, Any], access_control: Optional[AccessControlT] = None) -> None:
         pass
     
@@ -76,6 +80,7 @@ class LocalBackend(Backend):
     def __init__(self, settings: SettingsT, api_key: Optional[str] = None):
         super().__init__(settings, api_key)
         self._connections: Dict[str, duckdb.DuckDBPyConnection] = {}
+        
     
     def _get_db_path(self, database_id: str) -> str:
         if not self.api_key:
@@ -123,6 +128,96 @@ class LocalBackend(Backend):
             [table_name]
         )
         return [{"column_name": row[0], "data_type": row[1]} for row in result.fetchall()]
+    
+    def get_table_info(self, database_id: str, table_name: str) -> Optional[TableInfoT]:
+        if not self.table_exists(database_id, table_name):
+            return None
+        
+        conn = self._get_connection(database_id)
+        
+        # Check if metadata table exists
+        metadata_table_exists = self.table_exists(database_id, '_table_metadata')
+        if not metadata_table_exists:
+            # Return basic info without metadata
+            schema = self.get_table_schema(database_id, table_name)
+            from .types import ColumnMetadataT, DuckDBTypes
+            
+            parcel_schema = {}
+            for col_info in schema:
+                col_name = col_info["column_name"]
+                col_type = col_info["data_type"]
+                # Map DuckDB types to our enum
+                mapped_type = getattr(DuckDBTypes, col_type, DuckDBTypes.VARCHAR)
+                parcel_schema[col_name] = ColumnMetadataT(type=mapped_type)
+            
+            return TableInfoT(
+                table_name=table_name,
+                hint=None,
+                parcel_schema=parcel_schema,
+                readonly=True
+            )
+        
+        # Get metadata from the metadata table
+        try:
+            result = conn.execute(
+                "SELECT hint, parcel_schema_json, readonly FROM _table_metadata WHERE table_name = ?",
+                [table_name]
+            ).fetchone()
+            
+            if result:
+                import json
+                from .types import ColumnMetadataT, DuckDBTypes
+                
+                hint, schema_json, readonly = result
+                parcel_schema = {}
+                
+                if schema_json:
+                    schema_dict = json.loads(schema_json)
+                    for col_name, col_meta in schema_dict.items():
+                        # Handle foreign key references
+                        fk_ref = None
+                        if col_meta.get('foreign_key_references'):
+                            from .types import ForeignKeyReferenceT
+                            fk_data = col_meta['foreign_key_references']
+                            fk_ref = ForeignKeyReferenceT(
+                                table_name=fk_data.get('table_name'),
+                                column_name=fk_data.get('column_name')
+                            )
+                        
+                        parcel_schema[col_name] = ColumnMetadataT(
+                            type=DuckDBTypes(col_meta.get('type', 'VARCHAR')),
+                            description=col_meta.get('description'),
+                            foreign_key_references=fk_ref
+                        )
+                
+                return TableInfoT(
+                    table_name=table_name,
+                    hint=hint,
+                    parcel_schema=parcel_schema,
+                    readonly=bool(readonly)
+                )
+            
+        except Exception:
+            # Fall back to basic schema info if metadata retrieval fails
+            pass
+        
+        # Fallback: return basic info
+        schema = self.get_table_schema(database_id, table_name)
+        from .types import ColumnMetadataT, DuckDBTypes
+        
+        parcel_schema = {}
+        for col_info in schema:
+            col_name = col_info["column_name"]
+            col_type = col_info["data_type"]
+            mapped_type = getattr(DuckDBTypes, col_type, DuckDBTypes.VARCHAR)
+            parcel_schema[col_name] = ColumnMetadataT(type=mapped_type)
+        
+        return TableInfoT(
+            table_name=table_name,
+            hint=None,
+            parcel_schema=parcel_schema,
+            readonly=True
+        )
     
     def add_row(self, database_id: str, table_name: str, row_data: Dict[str, Any], access_control: Optional[AccessControlT] = None) -> None:
         if access_control and access_control.read_only:
@@ -243,38 +338,92 @@ class LocalBackend(Backend):
         # Return the schema
         return self.get_table_schema(database_id, table_name)
     
+    def apply_column_metadata_from_parcel(self, database_id: str, data: ParcelT):
+        """Apply column type changes based on provided metadata."""
+        conn = self._get_connection(database_id)
+        # Get current schema to check if columns exist
+        table_infos = [
+            self.get_table_info(database_id, table_name)
+            for table_name in data.table_name
+        ]
+        for table_info in table_infos:
+            if not table_info:
+                continue
+            for column_name, metadata in table_info.parcel_schema.items():
+                if metadata.type:
+                    if metadata.type:
+                        try:
+                            print(
+                                f"Altering column {data.table_name}.{column_name} to type {metadata.type}"
+                            )
+                            # Regular type alteration
+                            _ = conn.execute(
+                                f"ALTER TABLE {data.table_name} ALTER {column_name} TYPE {metadata.type.value}"
+                            )
+                        except Exception as e:
+                            print(
+                                f"Failed to alter column type/constraint for {data.table_name}.{column_name}: {str(e)}"
+                            )
+
     def load_parcel(self, database_id: str, parcel: ParcelT, overwrite: bool = False) -> None:
         conn = self._get_connection(database_id)
         
-        # Check if table exists
-        table_exists = self.table_exists(database_id, parcel.table_name)
-        
-        if table_exists and not overwrite:
-            raise ValueError(f"Table {parcel.table_name} already exists. Use overwrite=True to replace it.")
-        
-        if table_exists and overwrite:
+        """
+        Create a table in DuckDB from JSON data.
+
+        Args:
+            table_name: Name of the table to create
+            data: List of JSON objects/dictionaries for the table
+        """
+        if overwrite:
             conn.execute(f"DROP TABLE IF EXISTS {parcel.table_name}")
         
-        # Create table schema
-        schema_parts = []
+        # Convert data to JSON string and load it directly into DuckDB
+        json_data = json.dumps(parcel.rows)
+        temp_file = f"{parcel.table_name}_data.json"
+        with open(temp_file, "w") as f:
+            _ = f.write(json_data)
+        _ = conn.execute(
+            f"""
+            CREATE TABLE {parcel.table_name} AS 
+            SELECT * FROM read_json_auto('{temp_file}');
+        """
+        )
+        # Clean up temporary file
+        os.remove(temp_file)
+        self.apply_column_metadata_from_parcel(database_id, parcel)
+    
+    def _store_table_metadata(self, conn: duckdb.DuckDBPyConnection, parcel: ParcelT) -> None:
+        """Store parcel metadata in a dedicated metadata table"""
+        import json
+        
+        # Create metadata table if it doesn't exist
+        metadata_table_sql = """
+        CREATE TABLE IF NOT EXISTS _table_metadata (
+            table_name VARCHAR PRIMARY KEY,
+            hint VARCHAR,
+            parcel_schema_json VARCHAR,
+            readonly BOOLEAN
+        )
+        """
+        conn.execute(metadata_table_sql)
+        
+        # Convert parcel schema to JSON for storage
+        schema_dict = {}
         for col_name, col_meta in parcel.parcel_schema.items():
-            col_type = col_meta.type.value if col_meta.type else "VARCHAR"
-            schema_parts.append(f"{col_name} {col_type}")
+            schema_dict[col_name] = {
+                'type': col_meta.type.value if col_meta.type else None,
+                'description': col_meta.description,
+                'foreign_key_references': col_meta.foreign_key_references.model_dump() if col_meta.foreign_key_references else None
+            }
         
-        schema_sql = f"CREATE TABLE {parcel.table_name} ({', '.join(schema_parts)})"
-        conn.execute(schema_sql)
+        schema_json = json.dumps(schema_dict)
         
-        # Insert data
-        if parcel.rows:
-            columns = list(parcel.parcel_schema.keys())
-            placeholders = ', '.join(['?' for _ in columns])
-            insert_sql = f"INSERT INTO {parcel.table_name} ({', '.join(columns)}) VALUES ({placeholders})"
-            
-            for row in parcel.rows:
-                values = [row.get(col) for col in columns]
-                conn.execute(insert_sql, values)
-        
-        conn.commit()
+        # Insert or update metadata
+        conn.execute("""
+            INSERT OR REPLACE INTO _table_metadata (table_name, hint, parcel_schema_json, readonly)
+            VALUES (?, ?, ?, ?)
+        """, [parcel.table_name, parcel.hint, schema_json, parcel.readonly])
     
     def execute_sql(self, database_id: str, sql_query: str, params: Optional[Dict[str, Any]] = None, access_control: Optional[AccessControlT] = None) -> pd.DataFrame:
         conn = self._get_connection(database_id)
@@ -347,6 +496,10 @@ class ModalBackend(Backend):
     
     def get_table_schema(self, database_id: str, table_name: str) -> List[Dict[str, str]]:
         # TODO: Implement modal backend table schema retrieval
+        raise NotImplementedError("Modal backend not yet implemented")
+    
+    def get_table_info(self, database_id: str, table_name: str) -> Optional[TableInfoT]:
+        # TODO: Implement modal backend table info retrieval
         raise NotImplementedError("Modal backend not yet implemented")
     
     def add_row(self, database_id: str, table_name: str, row_data: Dict[str, Any], access_control: Optional[AccessControlT] = None) -> None:

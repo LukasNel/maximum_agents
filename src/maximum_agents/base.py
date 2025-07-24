@@ -1,10 +1,11 @@
 from pydantic import BaseModel
-
-from pydantic_final_answer_tools import PydanticFinalAnswerTool
+import json
+from .pydantic_final_answer_tools import PydanticFinalAnswerTool
 from .abstract import AbstractAgent
 from typing import Callable, Any, List, Dict, Optional, cast
-from .records import  PartT, ResultT, BasicAnswerT, StepT, ThinkingPartT, CodePartT, OutputPartT
-from smolagents import CodeAgent, Tool, LiteLLMModel, ChatMessage, ActionStep, PlanningStep, FinalAnswerStep, ChatMessageStreamDelta
+from .records import  PartT, ResultT, BasicAnswerT, StepT, ThinkingPartT, CodePartT, OutputPartT, ToolCallT
+from smolagents import CodeAgent, Tool, LiteLLMModel, ChatMessage, ActionStep, PlanningStep, FinalAnswerStep, ChatMessageStreamDelta, ToolCall
+from smolagents.agents import ToolOutput, ActionOutput
 from typing import Generator
 from litellm.exceptions import InternalServerError
 from .exponential_backoff import exponential_backoff_agentonly
@@ -113,9 +114,9 @@ class HookRegistry:
 def default_model_selection_hook(model: str) -> LiteLLMModel:
     """Default model selection hook that chooses between CachedAnthropicModel and RetryingModel."""
     if "anthropic" in model:
-        return CachedAnthropicModel(model=model)
+        return CachedAnthropicModel(model_id=model)
     else:
-        return RetryingModel(model=model)
+        return RetryingModel(model_id=model)
 
 
 class RetryingModel(LiteLLMModel):
@@ -198,6 +199,7 @@ class BaseAgent[T: BaseModel](AbstractAgent):
                     final_answer_description: str = "The final answer to the user's question.",
                     model: str="anthropic/claude-sonnet-4-20250514",
                     max_steps: int=35,
+                    hook_registry: Optional[HookRegistry] = None,
                  ):
         self.system_prompt = system_prompt
         self.final_answer_model = final_answer_model
@@ -212,12 +214,22 @@ class BaseAgent[T: BaseModel](AbstractAgent):
         )
         self.additional_authorized_imports = additional_authorized_imports
         self.max_steps = max_steps
-        self.hooks = HookRegistry()  # Initialize hook registry
+        self.hooks = hook_registry or HookRegistry()  # Use provided registry or create new one
         self.agent : CodeAgent | None = None
-        # Set up default model selection hook
-        self.hooks.add_model_selection_hook(default_model_selection_hook)
-        
+        # Set up default model selection hook if none exists
+        if not self.hooks.model_selection_hooks:
+            self.hooks.add_model_selection_hook(default_model_selection_hook)
+        self.hooks.add_system_prompt_hook(self._add_task_to_system_prompt)
+        self.hooks.add_system_prompt_hook(self._add_final_answer_description_to_system_prompt)
         self.model = self._setup_model(model)
+
+    def _add_task_to_system_prompt(self, system_prompt: str, task: str) -> str:
+        system_prompt = system_prompt + "\n\n Task: " + task
+        return system_prompt
+    
+    def _add_final_answer_description_to_system_prompt(self, system_prompt: str, task: str) -> str:
+        system_prompt = system_prompt + "\n\n" + self.final_answer_description + "\n\n" + json.dumps(self.final_answer_model.model_json_schema())
+        return system_prompt
     
     def _setup_model(self, model: str) -> LiteLLMModel:
         # Apply model setup hooks to modify the model name
@@ -233,18 +245,14 @@ class BaseAgent[T: BaseModel](AbstractAgent):
             return default_model_selection_hook(model)
  
     def _setup_system_prompt(self, task: str) -> str:
-        if "{task}" in self.system_prompt:
-            system_prompt = self.system_prompt.format(task=task)
-        else:
-            system_prompt = self.system_prompt + "\n\n Task: " + task
-        
         # Apply system prompt hooks
+        system_prompt = self.system_prompt
         for hook in self.hooks.system_prompt_hooks:
             system_prompt = hook(system_prompt, task)
         
         return system_prompt
     
-    def format_step(self, step: ActionStep | PlanningStep | FinalAnswerStep | ChatMessageStreamDelta) -> StepT | ResultT[T]:
+    def format_step(self, step: ActionStep | PlanningStep | FinalAnswerStep | ChatMessageStreamDelta | ToolCall | ToolOutput | ActionOutput) -> StepT | ResultT[T]:
         if isinstance(step, FinalAnswerStep):
             # Convert final answer to ResultT
             return ResultT[T](answer=self.final_answer_model.model_validate(step.output))
@@ -289,6 +297,37 @@ class BaseAgent[T: BaseModel](AbstractAgent):
             return StepT(step_number=None, parts=[ThinkingPartT(
                 content=step.content or ""
             )])
+        
+        elif isinstance(step, ToolOutput):
+            # Convert tool output to output part
+            return StepT(step_number=None, parts=[OutputPartT(
+                content=step.observation
+            )])
+        
+        elif isinstance(step, ActionOutput):
+            # Convert action output - if final answer, return ResultT, otherwise OutputPartT
+            if step.is_final_answer:
+                return ResultT[T](answer=self.final_answer_model.model_validate(step.output))
+            else:
+                return StepT(step_number=None, parts=[OutputPartT(
+                    content=str(step.output)
+                )])
+        
+        elif isinstance(step, ToolCall):
+            # Handle tool calls - python_interpreter becomes CodePartT, others become ToolCallT
+            tool_dict = cast(Dict[str, Any], step.dict())
+            function_info = cast(Dict[str, Any], tool_dict.get("function", {}))
+            tool_name = str(function_info.get("name", ""))
+            tool_arguments = function_info.get("arguments", {})
+            
+            if tool_name == "python_interpreter":
+                return StepT(step_number=None, parts=[CodePartT(content=str(tool_arguments))])
+            else:
+                # Format other tool calls as ToolCallT
+                # Ensure arguments is a dict
+                if not isinstance(tool_arguments, dict):
+                    tool_arguments = {"value": tool_arguments}
+                return StepT(step_number=None, parts=[ToolCallT(name=tool_name, arguments=cast(Dict[str, Any], tool_arguments))])
         
         else:
             # Fallback for unknown step types
@@ -348,6 +387,7 @@ class BaseAgent[T: BaseModel](AbstractAgent):
             additional_kwargs = self._execute_codeagent_kwargs_hooks()
             
             # Create CodeAgent with base parameters and additional kwargs
+            print(self.tools)
             self.agent = CodeAgent(
                 tools=self.tools,
                 model=self.model,
@@ -359,7 +399,7 @@ class BaseAgent[T: BaseModel](AbstractAgent):
             final_result = None
             
             # Use streaming approach - returns a generator that yields steps
-            step_generator = cast(Generator[ActionStep | PlanningStep | FinalAnswerStep | ChatMessageStreamDelta], self.agent.run(system_prompt, stream=True))
+            step_generator =  self.agent.run(system_prompt, stream=True)
             for step in step_generator:
                 # Execute pre-step hooks
                 step = self._execute_pre_step_hooks(step)

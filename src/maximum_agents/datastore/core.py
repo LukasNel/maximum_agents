@@ -2,7 +2,7 @@ from typing import Optional, Dict, Any, Union, List
 import pandas as pd
 import os
 from pathlib import Path
-from .types import SettingsT, ParcelT, AccessControlT, ColumnMetadataT, DuckDBTypes
+from .types import SettingsT, ParcelT, AccessControlT, ColumnMetadataT, DuckDBTypes, TableInfoT
 from .backends import get_backend, Backend
 
 
@@ -12,7 +12,7 @@ class MaximumDataStore:
         self.api_key = api_key
         self.backend: Backend = get_backend(settings, api_key)
     
-    def load_into_database(self, database_id: str, parcel: ParcelT, overwrite: bool = False) -> None:
+    def load_parcel_into_database(self, database_id: str, parcel: ParcelT, overwrite: bool = False) -> None:
         """
         Load a parcel of data into the specified database.
         
@@ -51,8 +51,8 @@ class MaximumDataStore:
         Raises:
             ValueError: If database doesn't exist or access control violations
         """
-        if not self.backend.database_exists(database_id):
-            raise ValueError(f"Database {database_id} does not exist")
+        # if not self.backend.database_exists(database_id):
+        #     raise ValueError(f"Database {database_id} does not exist")
         
         return self.backend.execute_sql(database_id, sql_query, optional_params, access_control)
     
@@ -89,6 +89,25 @@ class MaximumDataStore:
             raise ValueError(f"Database {database_id} does not exist")
         
         return self.backend.get_table_schema(database_id, table_name)
+    
+    def get_table_info(self, database_id: str, table_name: str) -> Optional[TableInfoT]:
+        """
+        Get detailed information about a table including metadata.
+        
+        Args:
+            database_id: Unique identifier for the database
+            table_name: Name of the table
+        
+        Returns:
+            Optional[TableInfoT]: Table information with metadata, or None if table doesn't exist
+        
+        Raises:
+            ValueError: If database doesn't exist
+        """
+        if not self.backend.database_exists(database_id):
+            raise ValueError(f"Database {database_id} does not exist")
+        
+        return self.backend.get_table_info(database_id, table_name)
     
     def add_row(self, database_id: str, table_name: str, row_data: Dict[str, Any], access_control: Optional[AccessControlT] = None) -> None:
         """
@@ -308,3 +327,56 @@ class MaximumDataStore:
         )
         
         return parcel
+
+    def get_database_description(self, database_id: str) -> str:
+        """
+        Get a complete description of the database including all tables and their schemas.
+        
+        Args:
+            database_id: Unique identifier for the database
+        
+        Returns:
+            str: A formatted string describing all tables and their schemas
+        
+        Raises:
+            ValueError: If database doesn't exist
+        """
+        if not self.backend.database_exists(database_id):
+            raise ValueError(f"Database {database_id} does not exist")
+        
+        tables = self.backend.list_tables(database_id)
+        
+        if not tables:
+            return f"Database '{database_id}' is empty (no tables found)."
+        
+        description_parts = [f"Database '{database_id}' contains {len(tables)} table(s):\n"]
+        
+        for table_name in tables:
+            # Skip metadata table from description
+            if table_name == '_table_metadata':
+                continue
+                
+            table_info = self.backend.get_table_info(database_id, table_name)
+            description_parts.append(f"\nTable: {table_name}")
+            
+            if table_info:
+                # Add hint if available
+                if table_info.hint:
+                    description_parts.append(f"  Description: {table_info.hint}")
+                
+                # Add readonly status
+                description_parts.append(f"  Read-only: {table_info.readonly}")
+                
+                # Add columns with enhanced information
+                if table_info.parcel_schema:
+                    description_parts.append("  Columns:")
+                    for col_name, col_meta in table_info.parcel_schema.items():
+                        col_type = col_meta.type.value if col_meta.type else "unknown"
+                        col_desc = f" - {col_meta.description}" if col_meta.description else ""
+                        description_parts.append(f"    - {col_name}: {col_type}{col_desc}")
+                else:
+                    description_parts.append("  (No schema information available)")
+            else:
+                description_parts.append("  (Table information not available)")
+        
+        return "\n".join(description_parts)

@@ -75,10 +75,15 @@ class ParcelT(BaseModel):
     table_name: str
     hint: Optional[str] = None
     parcel_schema: Dict[ColumnNameT, ColumnMetadataT]
-    rows: ParcelDataT
     readonly: bool = True
+    rows: ParcelDataT
 
 
+class TableInfoT(BaseModel):
+    table_name: str
+    hint: Optional[str] = None
+    parcel_schema: Dict[ColumnNameT, ColumnMetadataT]
+    readonly: bool = True
 class SettingsT(BaseModel):
     backend: str = "local"  # "local" or "modal"
     database_path: Optional[str] = None
