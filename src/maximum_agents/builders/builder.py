@@ -138,8 +138,6 @@ class AgentBuilder:
             images = image_adder()
             for image in images:
                 image = image.convert('RGB')
-                # Convert F mode image to RGB before saving as PNG
-                image.save("image" + str(uuid.uuid4()) + ".png")
             
             if images:
                 # Add the images to the step log so the agent can see them

@@ -1,11 +1,14 @@
 from pydantic import BaseModel
 import json
+
+from smolagents.utils import extract_code_from_text
 from .pydantic_final_answer_tools import PydanticFinalAnswerTool
 from .abstract import AbstractAgent
 from typing import Callable, Any, List, Dict, Optional, cast
 from .records import  PartT, ResultT, BasicAnswerT, StepT, ThinkingPartT, CodePartT, OutputPartT, ToolCallT
-from smolagents import CodeAgent, Tool, LiteLLMModel, ChatMessage, ActionStep, PlanningStep, FinalAnswerStep, ChatMessageStreamDelta, ToolCall
+from smolagents import CodeAgent, Tool, LiteLLMModel, ChatMessage, ChatMessageStreamDelta, ToolCall
 from smolagents.agents import ToolOutput, ActionOutput
+from smolagents.memory import ActionStep, PlanningStep, FinalAnswerStep
 from typing import Generator
 from litellm.exceptions import InternalServerError
 from .exponential_backoff import exponential_backoff_agentonly
@@ -189,6 +192,20 @@ class CachedAnthropicModel(RetryingModel):
             **kwargs,
         )
 
+def clear_code_from_text_and_return_seperate_text(text: str, code_block_tags: tuple[str, str]) -> tuple[str, str | None]:
+    code_action = extract_code_from_text(text, code_block_tags)
+    if code_action:
+        text = text.replace(code_action, "")
+    return text, code_action
+
+def content_to_thinking_and_optionally_code(content: str, code_block_tags: tuple[str, str]) -> list[PartT]:
+    text, code_action = clear_code_from_text_and_return_seperate_text(content, code_block_tags)
+    parts = []
+    if code_action:
+        parts.append(CodePartT(content=code_action))
+    if text:
+        parts.append(ThinkingPartT(content=text))
+    return parts
 
 class BaseAgent[T: BaseModel](AbstractAgent):
     def __init__(self, 
@@ -252,64 +269,33 @@ class BaseAgent[T: BaseModel](AbstractAgent):
         
         return system_prompt
     
-    def format_step(self, step: ActionStep | PlanningStep | FinalAnswerStep | ChatMessageStreamDelta | ToolCall | ToolOutput | ActionOutput) -> StepT | ResultT[T]:
-        if isinstance(step, FinalAnswerStep):
-            # Convert final answer to ResultT
-            return ResultT[T](answer=self.final_answer_model.model_validate(step.output))
-        
-        elif isinstance(step, ActionStep):
-            parts = []
-            step_number = step.step_number
-            
-            # Add thinking part if model output exists
-            if step.model_output:
-                content = step.model_output if isinstance(step.model_output, str) else str(step.model_output)
-                parts.append(ThinkingPartT(
-                    content=content
-                ))
-            
-            # Add code part if code action exists
-            if step.code_action:
-                parts.append(CodePartT(
-                    content=step.code_action
-                ))
-            
-            # Add output part if observations exist
-            if step.observations:
-                parts.append(OutputPartT(
-                    content=step.observations
-                ))
-            
-            # If this is a final answer step, return the result instead
-            if step.is_final_answer and step.action_output is not None:
-                return ResultT[T](answer=self.final_answer_model.model_validate(step.action_output))
-            
-            return StepT(step_number=step_number, parts=parts)
-        
-        elif isinstance(step, PlanningStep):
-            # Convert planning step to thinking part
-            return StepT(step_number=None, parts=[ThinkingPartT(
-                content=step.plan
-            )])
-        
-        elif isinstance(step, ChatMessageStreamDelta):
+    def format_step(self,step_number : int, step: ChatMessageStreamDelta | ToolCall | ToolOutput | ActionOutput | ActionStep | PlanningStep | FinalAnswerStep) -> StepT | ResultT[T]:
+        assert self.agent is not None
+        if isinstance(step, ChatMessageStreamDelta):
             # Convert streaming content to thinking part
-            return StepT(step_number=None, parts=[ThinkingPartT(
+            return StepT(step_number=step_number, parts=[ThinkingPartT(
                 content=step.content or ""
             )])
         
         elif isinstance(step, ToolOutput):
             # Convert tool output to output part
-            return StepT(step_number=None, parts=[OutputPartT(
-                content=step.observation
-            )])
+            observation = step.observation
+            code_action = extract_code_from_text(observation, self.agent.code_block_tags)
+            parts = []
+
+            if code_action:
+                observation = observation.replace(code_action, "")
+                parts.append(CodePartT(content=code_action))
+            if observation:
+                parts.append(OutputPartT(content=observation))
+            return StepT(step_number=step_number, parts=parts)
         
         elif isinstance(step, ActionOutput):
             # Convert action output - if final answer, return ResultT, otherwise OutputPartT
             if step.is_final_answer:
                 return ResultT[T](answer=self.final_answer_model.model_validate(step.output))
             else:
-                return StepT(step_number=None, parts=[OutputPartT(
+                return StepT(step_number=step_number, parts=[OutputPartT(
                     content=str(step.output)
                 )])
         
@@ -321,13 +307,77 @@ class BaseAgent[T: BaseModel](AbstractAgent):
             tool_arguments = function_info.get("arguments", {})
             
             if tool_name == "python_interpreter":
-                return StepT(step_number=None, parts=[CodePartT(content=str(tool_arguments))])
+                return StepT(step_number=step_number, parts=[CodePartT(content=str(tool_arguments))])
             else:
                 # Format other tool calls as ToolCallT
                 # Ensure arguments is a dict
                 if not isinstance(tool_arguments, dict):
                     tool_arguments = {"value": tool_arguments}
-                return StepT(step_number=None, parts=[ToolCallT(name=tool_name, arguments=cast(Dict[str, Any], tool_arguments))])
+                return StepT(step_number=step_number, parts=[ToolCallT(name=tool_name, arguments=cast(Dict[str, Any], tool_arguments))])
+        
+        elif isinstance(step, ActionStep):
+            # Handle ActionStep - extract different parts and separate code blocks
+            parts = []
+            
+            # If this is a final answer, return ResultT
+            if step.is_final_answer and step.action_output is not None:
+                return ResultT[T](answer=self.final_answer_model.model_validate(step.action_output))
+            
+            # Handle model output (thinking/reasoning text with potential code blocks)
+            if step.model_output:
+                if isinstance(step.model_output, str):
+                    model_parts = content_to_thinking_and_optionally_code(step.model_output, self.agent.code_block_tags)
+                    parts.extend(model_parts)
+                else:
+                    # Handle list format - convert to string first
+                    model_output_str = str(step.model_output)
+                    model_parts = content_to_thinking_and_optionally_code(model_output_str, self.agent.code_block_tags)
+                    parts.extend(model_parts)
+            
+            # Handle separate code action if present
+            if step.code_action:
+                parts.append(CodePartT(content=step.code_action))
+            
+            # Handle observations (tool outputs, execution results)
+            if step.observations:
+                observation_parts = content_to_thinking_and_optionally_code(step.observations, self.agent.code_block_tags)
+                # Convert thinking parts from observations to output parts
+                for part in observation_parts:
+                    if isinstance(part, ThinkingPartT):
+                        parts.append(OutputPartT(content=part.content))
+                    else:
+                        parts.append(part)
+            
+            # Handle action output (if not final answer)
+            if step.action_output is not None and not step.is_final_answer:
+                action_output_str = str(step.action_output)
+                output_parts = content_to_thinking_and_optionally_code(action_output_str, self.agent.code_block_tags)
+                # Convert thinking parts to output parts for action outputs
+                for part in output_parts:
+                    if isinstance(part, ThinkingPartT):
+                        parts.append(OutputPartT(content=part.content))
+                    else:
+                        parts.append(part)
+            
+            return StepT(step_number=step_number, parts=parts)
+        
+        elif isinstance(step, PlanningStep):
+            # Handle PlanningStep - extract plan text and separate code blocks
+            parts = []
+            
+            if step.plan:
+                plan_parts = content_to_thinking_and_optionally_code(step.plan, self.agent.code_block_tags)
+                parts.extend(plan_parts)
+            
+            return StepT(step_number=step_number, parts=parts)
+        
+        elif isinstance(step, FinalAnswerStep):
+            # Handle FinalAnswerStep - this should be the final result
+            if step.output is not None:
+                return ResultT[T](answer=self.final_answer_model.model_validate(step.output))
+            else:
+                # If no output, treat as empty step
+                return StepT(step_number=step_number, parts=[])
         
         else:
             # Fallback for unknown step types
@@ -400,21 +450,24 @@ class BaseAgent[T: BaseModel](AbstractAgent):
             
             # Use streaming approach - returns a generator that yields steps
             step_generator =  self.agent.run(system_prompt, stream=True)
+            step_number = 1
             for step in step_generator:
                 # Execute pre-step hooks
                 step = self._execute_pre_step_hooks(step)
                 
                 # Format the step
-                formatted_step = self.format_step(step)
+                formatted_step = self.format_step(step_number, step)
                 
                 # Execute post-step hooks
                 formatted_step = self._execute_post_step_hooks(step, formatted_step)
                 
                 if isinstance(formatted_step, ResultT):
                     final_result = formatted_step
+                    break  # We found our final result
                 else:
                     log(formatted_step)
-                    
+                step_number += 1
+            
             if final_result is None:
                 raise NoFinalResultError("No final result found")
             
