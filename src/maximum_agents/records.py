@@ -10,15 +10,21 @@ class PartType(str, Enum):
 class ThinkingPartT(BaseModel):
     type: PartType = PartType.THINKING
     content: str
-
+    def __str__(self) -> str:
+        return f"Thinking: {self.content}"
+    
 class CodePartT(BaseModel):
     type: PartType = PartType.CODE
     content: str
-
+    def __str__(self) -> str:
+        return f"Code: {self.content}"
+    
 class OutputPartT(BaseModel):
     type: PartType = PartType.OUTPUT
     content: str
-
+    def __str__(self) -> str:
+        return f"Output: {self.content}"
+    
 class ToolCallT(BaseModel):
     type: PartType = PartType.TOOL_CALL
     name: str
