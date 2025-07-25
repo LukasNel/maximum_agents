@@ -20,15 +20,16 @@ class NoFinalResultError(Exception):
 # Hook type definitions
 HookCallback = Callable[..., Any]
 PreRunHook = Callable[[str], str]  # Takes task, returns potentially modified task
-PostRunHook = Callable[[str, ResultT[Any]], ResultT[Any]]  # Takes task and result, returns potentially modified result
+PostRunHook = Callable[[str, ResultT[BaseModel]], ResultT[BaseModel]]  # Takes task and result, returns potentially modified result
 PreStepHook = Callable[[Any], Any]  # Takes step, returns potentially modified step
-PostStepHook = Callable[[Any, StepT | ResultT[Any]], StepT | ResultT[Any]]  # Takes original step and formatted step, returns potentially modified formatted step
-ErrorHook = Callable[[Exception, str], Optional[ResultT[Any]]]  # Takes exception and task, returns optional result to continue or None to re-raise
+PostStepHook = Callable[[Any, StepT | ResultT[BaseModel]], StepT | ResultT[BaseModel]]  # Takes original step and formatted step, returns potentially modified formatted step
+ErrorHook = Callable[[Exception, str], Optional[ResultT[BaseModel]]]  # Takes exception and task, returns optional result to continue or None to re-raise
 ModelSetupHook = Callable[[str], str]  # Takes model name, returns potentially modified model name
 ModelSelectionHook = Callable[[str], LiteLLMModel]  # Takes model name, returns instantiated model
 CodeAgentKwargsHook = Callable[[], Dict[str, Any]]  # Returns additional kwargs for CodeAgent constructor
 SystemPromptHook = Callable[[str, str], str]  # Takes system_prompt and task, returns potentially modified system_prompt
-
+FinalAnswerContextHook = Callable[[dict[str, Any]], dict[str, Any]]  # Takes context, returns potentially modified context
+AddInternalStepHook = Callable[[ActionStep], None]  # Takes step, returns potentially modified step
 
 class HookRegistry:
     """Registry for managing hooks of different types."""
@@ -38,11 +39,13 @@ class HookRegistry:
         self.post_run_hooks: List[PostRunHook] = []
         self.pre_step_hooks: List[PreStepHook] = []
         self.post_step_hooks: List[PostStepHook] = []
-        self.error_hooks: List[ErrorHook] = []
+        self.error_hooks: List[ErrorHook] = []  
         self.model_setup_hooks: List[ModelSetupHook] = []
         self.model_selection_hooks: List[ModelSelectionHook] = []
         self.codeagent_kwargs_hooks: List[CodeAgentKwargsHook] = []
         self.system_prompt_hooks: List[SystemPromptHook] = []
+        self.final_answer_context_hooks: List[FinalAnswerContextHook] = []
+        self.add_internal_step_hooks: List[AddInternalStepHook] = []
     
     def add_pre_run_hook(self, hook: PreRunHook):
         """Add a hook that runs before agent execution starts."""
@@ -80,6 +83,14 @@ class HookRegistry:
         """Add a hook that runs during system prompt setup."""
         self.system_prompt_hooks.append(hook)
     
+    def add_final_answer_context_hook(self, hook: FinalAnswerContextHook):
+        """Add a hook that runs during final answer context setup."""
+        self.final_answer_context_hooks.append(hook)
+    
+    def add_add_internal_step_hook(self, hook: AddInternalStepHook):
+        """Add a hook that runs during internal step addition."""
+        self.add_internal_step_hooks.append(hook)
+
     def clear_hooks(self, hook_type: Optional[str] = None):
         """Clear hooks of a specific type or all hooks if hook_type is None."""
         if hook_type is None:
@@ -110,6 +121,10 @@ class HookRegistry:
             self.codeagent_kwargs_hooks.clear()
         elif hook_type == "system_prompt":
             self.system_prompt_hooks.clear()
+        elif hook_type == "add_internal_step":
+            self.add_internal_step_hooks.clear()
+        elif hook_type == "final_answer_context":
+            self.final_answer_context_hooks.clear()
         else:
             raise ValueError(f"Unknown hook type: {hook_type}")
 
@@ -218,29 +233,34 @@ def deduplicate_parts(parts: list[PartT]) -> list[PartT]:
             deduplicated_parts.append(part)
     return deduplicated_parts
 
+def add_truncate_observation_to_step(step: ActionStep, max_print_outputs_length: int) -> None:
+    with open("output.txt", "a") as f:
+        f.write(step.observations or "[NO OBSERVATIONS]")
+        f.write("\n\n")
+    if step.error is not None and len(step.error.message) > max_print_outputs_length:
+        # basically I want to truncate the error message
+        # and add a note there saying that the output was truncated
+        step.error.message = step.error.message[:max_print_outputs_length//2] + "\n\n[TRUNCATED] The above error message was truncated due to the max_print_outputs_length limit." + step.error.message[max_print_outputs_length//2:]
+
 class BaseAgent[T: BaseModel](AbstractAgent):
     def __init__(self, 
                     system_prompt: str, 
                     tools: list[Tool],
                     additional_authorized_imports: list[str],
+                    max_print_outputs_length: int = 50000,
                     final_answer_model: type[T] = BasicAnswerT,
                     final_answer_description: str = "The final answer to the user's question.",
                     model: str="anthropic/claude-sonnet-4-20250514",
                     max_steps: int=35,
                     hook_registry: Optional[HookRegistry] = None,
+                    final_answer_context: dict[str, Any] = {},
                  ):
         self.system_prompt = system_prompt
         self.final_answer_model = final_answer_model
         self.final_answer_description = final_answer_description
         self.tools = tools
-        self.tools.append(
-            PydanticFinalAnswerTool(
-                self.final_answer_model,
-                description=self.final_answer_description
-                or "The final answer to the user's question.",
-            )
-        )
         self.additional_authorized_imports = additional_authorized_imports
+        self.max_print_outputs_length = max_print_outputs_length
         self.max_steps = max_steps
         self.hooks = hook_registry or HookRegistry()  # Use provided registry or create new one
         self.agent : CodeAgent | None = None
@@ -250,13 +270,26 @@ class BaseAgent[T: BaseModel](AbstractAgent):
         self.hooks.add_system_prompt_hook(self._add_task_to_system_prompt)
         self.hooks.add_system_prompt_hook(self._add_final_answer_description_to_system_prompt)
         self.model = self._setup_model(model)
+        self.final_answer_context = final_answer_context
+        for hook in self.hooks.final_answer_context_hooks:
+            self.final_answer_context = hook(self.final_answer_context)
+        # Add PydanticFinalAnswerTool after context has been processed
+        self.tools.append(
+            PydanticFinalAnswerTool(
+                self.final_answer_model,
+                description=self.final_answer_description
+                or "The final answer to the user's question.",
+                context=self.final_answer_context,
+            )
+        )
+        self.hooks.add_add_internal_step_hook(lambda step: add_truncate_observation_to_step(step, self.max_print_outputs_length))
 
     def _add_task_to_system_prompt(self, system_prompt: str, task: str) -> str:
         system_prompt = system_prompt + "\n\n Task: " + task
         return system_prompt
     
     def _add_final_answer_description_to_system_prompt(self, system_prompt: str, task: str) -> str:
-        system_prompt = system_prompt + "\n\n" + self.final_answer_description + "\n\n" + json.dumps(self.final_answer_model.model_json_schema())
+        system_prompt = system_prompt + "\n\n Final Answer Description: " + self.final_answer_description + "\n\n Final Answer Schema: " + json.dumps(self.final_answer_model.model_json_schema())
         return system_prompt
     
     def _setup_model(self, model: str) -> LiteLLMModel:
@@ -289,7 +322,7 @@ class BaseAgent[T: BaseModel](AbstractAgent):
             
             # If this is a final answer, return ResultT
             if step.is_final_answer and step.action_output is not None:
-                return ResultT[T](answer=self.final_answer_model.model_validate(step.action_output))
+                return ResultT[T](answer=self.final_answer_model.model_validate(step.action_output, context=self.final_answer_context))
             
             # Handle model output (thinking/reasoning text) - but don't extract code since code_action has it
             if step.model_output:
@@ -344,7 +377,7 @@ class BaseAgent[T: BaseModel](AbstractAgent):
         elif isinstance(step, FinalAnswerStep):
             # Handle FinalAnswerStep - this should be the final result
             if step.output is not None:
-                return ResultT[T](answer=self.final_answer_model.model_validate(step.output))
+                return ResultT[T](answer=self.final_answer_model.model_validate(step.output, context=self.final_answer_context))
             else:
                 # If no output, treat as empty step
                 return StepT(step_number=step_number, parts=[])
@@ -413,6 +446,8 @@ class BaseAgent[T: BaseModel](AbstractAgent):
                 model=self.model,
                 additional_authorized_imports=self.additional_authorized_imports,
                 max_steps=self.max_steps,
+                max_print_outputs_length=self.max_print_outputs_length,
+                step_callbacks=self.hooks.add_internal_step_hooks,
                 **additional_kwargs
             )
             system_prompt = self._setup_system_prompt(task)
