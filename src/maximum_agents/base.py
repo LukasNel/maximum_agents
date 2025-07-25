@@ -451,22 +451,25 @@ class BaseAgent[T: BaseModel](AbstractAgent):
             # Use streaming approach - returns a generator that yields steps
             step_generator =  self.agent.run(system_prompt, stream=True)
             step_number = 1
-            for step in step_generator:
-                # Execute pre-step hooks
-                step = self._execute_pre_step_hooks(step)
-                
-                # Format the step
-                formatted_step = self.format_step(step_number, step)
-                
-                # Execute post-step hooks
-                formatted_step = self._execute_post_step_hooks(step, formatted_step)
-                
-                if isinstance(formatted_step, ResultT):
-                    final_result = formatted_step
-                    break  # We found our final result
-                else:
-                    log(formatted_step)
-                step_number += 1
+            try:
+                for step in step_generator:
+                    # Execute pre-step hooks
+                    step = self._execute_pre_step_hooks(step)
+                    
+                    # Format the step
+                    formatted_step = self.format_step(step_number, step)
+                    
+                    # Execute post-step hooks
+                    formatted_step = self._execute_post_step_hooks(step, formatted_step)
+                    
+                    if isinstance(formatted_step, ResultT):
+                        final_result = formatted_step
+                        break  # We found our final result
+                    else:
+                        log(formatted_step)
+                    step_number += 1
+            except GeneratorExit:
+                pass
             
             if final_result is None:
                 raise NoFinalResultError("No final result found")
