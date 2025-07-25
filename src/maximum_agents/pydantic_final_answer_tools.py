@@ -227,14 +227,16 @@ class PydanticFinalAnswerTool(FinalAnswerTool):
         self,
         model: Type[BaseModel],
         description: str = "A user object",
+        context: dict[str, Any] = {},
         *args,
         **kwargs,
     ):
         self.inputs: Dict[str, Any] = {"answer": pydantic_to_schema(model, description)}
         self.model_pydantic: Type[BaseModel] = model
+        self.context = context
         super().__init__(*args, **kwargs)
 
     def forward(self, answer: dict[str, Any]) -> dict[str, Any]:
-        data = self.model_pydantic.model_validate(answer, context={})
+        data = self.model_pydantic.model_validate(answer, context=self.context)
 
         return data.model_dump()

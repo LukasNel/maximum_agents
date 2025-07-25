@@ -7,11 +7,14 @@ from contextlib import contextmanager
 import uuid
 from PIL import Image
 from io import BytesIO
+from maximum_agents.records import ResultT
+from openai import BaseModel
 from smolagents import ActionStep, Tool
 
 from ..datastore.core import MaximumDataStore
 from ..datastore.types import SettingsT
 from ..base import HookRegistry
+from ..document_types import DocumentT, DocumentsT
 
 class DatabaseTool(Tool):
     name = "sqlengine"
@@ -38,6 +41,7 @@ class AgentBuilder:
     def __init__(self, hook_registry: Optional[HookRegistry] = None):
         self.hook_registry = hook_registry or HookRegistry()
         self._temp_dir: Optional[str] = None
+        self._specific_dir: Optional[str] = None
         self._datastore: Optional[MaximumDataStore] = None
         self._database_id: Optional[str] = None
         self._image_adder: Optional[Callable[[], List[Image.Image]]] = None
@@ -58,8 +62,9 @@ class AgentBuilder:
                 os.chdir(self._temp_dir)
             return task
         
-        # Add post-run hook to change back to original directory
+        # Add post-run hook to change back directory (no document processing needed)
         def temp_dir_post_run_hook(task: str, result):
+            # Change back to original directory
             if self._original_cwd:
                 os.chdir(self._original_cwd)
             return result
@@ -70,11 +75,78 @@ class AgentBuilder:
                 os.chdir(self._original_cwd)
             return None  # Don't handle the error, just cleanup
         
+        # Add document_finder to final_answer_context
+        def add_temp_document_finder_to_context(context: dict[str, Any]) -> dict[str, Any]:
+            def document_finder(relative_path: str) -> str:
+                """Convert relative path to absolute path based on temp directory."""
+                if os.path.isabs(relative_path):
+                    return relative_path
+                else:
+                    temp_dir = self._temp_dir or os.getcwd()
+                    return os.path.abspath(os.path.join(temp_dir, relative_path))
+            
+            context['document_finder'] = document_finder
+            return context
+        
         self.hook_registry.add_pre_run_hook(temp_dir_pre_run_hook)
         self.hook_registry.add_post_run_hook(temp_dir_post_run_hook)
         self.hook_registry.add_error_hook(temp_dir_error_hook)
+        self.hook_registry.add_final_answer_context_hook(add_temp_document_finder_to_context)
         
         return self
+    
+    def put_agent_in_specific_dir(self, directory_path: str) -> 'AgentBuilder':
+        """
+        Configure the agent to run in a specific directory.
+        
+        Args:
+            directory_path: Path to the directory where the agent should run
+        """
+        # Ensure the directory exists
+        os.makedirs(directory_path, exist_ok=True)
+        self._specific_dir = os.path.abspath(directory_path)
+        
+        # Add pre-run hook to change to specific directory
+        def specific_dir_pre_run_hook(task: str) -> str:
+            if self._specific_dir:
+                self._original_cwd = os.getcwd()
+                os.chdir(self._specific_dir)
+            return task
+        
+        # Add post-run hook to change back directory (no document processing needed)
+        def specific_dir_post_run_hook(task: str, result):
+            # Change back to original directory
+            if self._original_cwd:
+                os.chdir(self._original_cwd)
+            return result
+        
+        # Add error hook to ensure we change back even on errors
+        def specific_dir_error_hook(error: Exception, task: str):
+            if self._original_cwd:
+                os.chdir(self._original_cwd)
+            return None  # Don't handle the error, just cleanup
+        
+        # Add document_finder to final_answer_context
+        def add_document_finder_to_context(context: dict[str, Any]) -> dict[str, Any]:
+            def document_finder(relative_path: str) -> str:
+                """Convert relative path to absolute path based on specific directory."""
+                if os.path.isabs(relative_path):
+                    return relative_path
+                else:
+                    specific_dir = self._specific_dir or os.getcwd()
+                    return os.path.abspath(os.path.join(specific_dir, relative_path))
+            
+            context['document_finder'] = document_finder
+            return context
+        
+        self.hook_registry.add_pre_run_hook(specific_dir_pre_run_hook)
+        self.hook_registry.add_post_run_hook(specific_dir_post_run_hook)
+        self.hook_registry.add_error_hook(specific_dir_error_hook)
+        self.hook_registry.add_final_answer_context_hook(add_document_finder_to_context)
+        
+        return self
+    
+
     
     def add_database(self, datastore: MaximumDataStore, database_id: str) -> 'AgentBuilder':
         """
@@ -149,14 +221,8 @@ class AgentBuilder:
                     step_log.observations = viz_text
                 else:
                     step_log.observations = step_log.observations + "\n" + viz_text
-                            
         
-        # Add step_callbacks via codeagent_kwargs hook
-        def image_kwargs_hook() -> Dict[str, Any]:
-            print("image_kwargs_hook")
-            return {"step_callbacks": [process_visualizations]}
-        
-        self.hook_registry.add_codeagent_kwargs_hook(image_kwargs_hook)
+        self.hook_registry.add_add_internal_step_hook(process_visualizations)
         
         return self
     
@@ -199,7 +265,8 @@ class AgentBuilder:
         """
         self.additional_imports.extend(imports)
         return self
-    
+
+
     def build_agent(self, agent_class, *args, **kwargs):
         """
         Build and configure the agent with all added capabilities.
@@ -226,6 +293,7 @@ class AgentBuilder:
         if self._temp_dir and os.path.exists(self._temp_dir):
             shutil.rmtree(self._temp_dir)
             self._temp_dir = None
+        # Note: We don't clean up specific directories as they are user-provided
     
     def __enter__(self):
         """Context manager entry."""
