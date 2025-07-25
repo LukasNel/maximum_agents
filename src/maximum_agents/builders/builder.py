@@ -12,6 +12,7 @@ from smolagents import ActionStep, Tool
 from ..datastore.core import MaximumDataStore
 from ..datastore.types import SettingsT
 from ..base import HookRegistry
+from ..document_types import DocumentT, DocumentsT
 
 class DatabaseTool(Tool):
     name = "sqlengine"
@@ -38,6 +39,7 @@ class AgentBuilder:
     def __init__(self, hook_registry: Optional[HookRegistry] = None):
         self.hook_registry = hook_registry or HookRegistry()
         self._temp_dir: Optional[str] = None
+        self._specific_dir: Optional[str] = None
         self._datastore: Optional[MaximumDataStore] = None
         self._database_id: Optional[str] = None
         self._image_adder: Optional[Callable[[], List[Image.Image]]] = None
@@ -58,8 +60,12 @@ class AgentBuilder:
                 os.chdir(self._temp_dir)
             return task
         
-        # Add post-run hook to change back to original directory
+        # Add post-run hook to change back and process documents
         def temp_dir_post_run_hook(task: str, result):
+            # Process DocumentsT result to populate absolute_path
+            result = self._process_documents_result(result)
+            
+            # Change back to original directory
             if self._original_cwd:
                 os.chdir(self._original_cwd)
             return result
@@ -75,6 +81,71 @@ class AgentBuilder:
         self.hook_registry.add_error_hook(temp_dir_error_hook)
         
         return self
+    
+    def put_agent_in_specific_dir(self, directory_path: str) -> 'AgentBuilder':
+        """
+        Configure the agent to run in a specific directory.
+        
+        Args:
+            directory_path: Path to the directory where the agent should run
+        """
+        # Ensure the directory exists
+        os.makedirs(directory_path, exist_ok=True)
+        self._specific_dir = os.path.abspath(directory_path)
+        
+        # Add pre-run hook to change to specific directory
+        def specific_dir_pre_run_hook(task: str) -> str:
+            if self._specific_dir:
+                self._original_cwd = os.getcwd()
+                os.chdir(self._specific_dir)
+            return task
+        
+        # Add post-run hook to change back and process documents
+        def specific_dir_post_run_hook(task: str, result):
+            # Process DocumentsT result to populate absolute_path
+            result = self._process_documents_result(result)
+            
+            # Change back to original directory
+            if self._original_cwd:
+                os.chdir(self._original_cwd)
+            return result
+        
+        # Add error hook to ensure we change back even on errors
+        def specific_dir_error_hook(error: Exception, task: str):
+            if self._original_cwd:
+                os.chdir(self._original_cwd)
+            return None  # Don't handle the error, just cleanup
+        
+        self.hook_registry.add_pre_run_hook(specific_dir_pre_run_hook)
+        self.hook_registry.add_post_run_hook(specific_dir_post_run_hook)
+        self.hook_registry.add_error_hook(specific_dir_error_hook)
+        
+        return self
+    
+    def _process_documents_result(self, result):
+        """
+        Process result to populate absolute_path field in DocumentT objects.
+        This should be called before moving out of the working directory.
+        """
+        if hasattr(result, 'documents') and isinstance(result.documents, list):
+            # This is a DocumentsT object
+            current_dir = os.getcwd()
+            for doc in result.documents:
+                if hasattr(doc, 'path') and hasattr(doc, 'absolute_path'):
+                    # Convert relative path to absolute path
+                    if not os.path.isabs(doc.path):
+                        doc.absolute_path = os.path.abspath(os.path.join(current_dir, doc.path))
+                    else:
+                        doc.absolute_path = doc.path
+        elif hasattr(result, 'path') and hasattr(result, 'absolute_path'):
+            # This is a single DocumentT object
+            current_dir = os.getcwd()
+            if not os.path.isabs(result.path):
+                result.absolute_path = os.path.abspath(os.path.join(current_dir, result.path))
+            else:
+                result.absolute_path = result.path
+        
+        return result
     
     def add_database(self, datastore: MaximumDataStore, database_id: str) -> 'AgentBuilder':
         """
@@ -226,6 +297,7 @@ class AgentBuilder:
         if self._temp_dir and os.path.exists(self._temp_dir):
             shutil.rmtree(self._temp_dir)
             self._temp_dir = None
+        # Note: We don't clean up specific directories as they are user-provided
     
     def __enter__(self):
         """Context manager entry."""
