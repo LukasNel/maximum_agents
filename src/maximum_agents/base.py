@@ -234,9 +234,6 @@ def deduplicate_parts(parts: list[PartT]) -> list[PartT]:
     return deduplicated_parts
 
 def add_truncate_observation_to_step(step: ActionStep, max_print_outputs_length: int) -> None:
-    with open("output.txt", "a") as f:
-        f.write(step.observations or "[NO OBSERVATIONS]")
-        f.write("\n\n")
     if step.error is not None and len(step.error.message) > max_print_outputs_length:
         # basically I want to truncate the error message
         # and add a note there saying that the output was truncated
