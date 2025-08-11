@@ -129,12 +129,12 @@ class HookRegistry:
             raise ValueError(f"Unknown hook type: {hook_type}")
 
 
-def default_model_selection_hook(model: str) -> LiteLLMModel:
+def default_model_selection_hook(model: str, model_kwargs: dict[str, Any]) -> LiteLLMModel:
     """Default model selection hook that chooses between CachedAnthropicModel and RetryingModel."""
     if "anthropic" in model:
-        return CachedAnthropicModel(model_id=model)
+        return CachedAnthropicModel(model_id=model, **model_kwargs)
     else:
-        return RetryingModel(model_id=model)
+        return RetryingModel(model_id=model, **model_kwargs)
 
 
 class RetryingModel(LiteLLMModel):
@@ -248,6 +248,7 @@ class BaseAgent[T: BaseModel](AbstractAgent):
                     final_answer_model: type[T] = BasicAnswerT,
                     final_answer_description: str = "The final answer to the user's question.",
                     model: str="anthropic/claude-sonnet-4-20250514",
+                    model_kwargs: dict[str, Any] = {},
                     max_steps: int=35,
                     hook_registry: Optional[HookRegistry] = None,
                     final_answer_context: dict[str, Any] = {},
@@ -263,7 +264,7 @@ class BaseAgent[T: BaseModel](AbstractAgent):
         self.agent : CodeAgent | None = None
         # Set up default model selection hook if none exists
         if not self.hooks.model_selection_hooks:
-            self.hooks.add_model_selection_hook(default_model_selection_hook)
+            self.hooks.add_model_selection_hook(lambda model: default_model_selection_hook(model, model_kwargs))
         self.hooks.add_system_prompt_hook(self._add_task_to_system_prompt)
         self.hooks.add_system_prompt_hook(self._add_final_answer_description_to_system_prompt)
         self.model = self._setup_model(model)
@@ -438,6 +439,7 @@ class BaseAgent[T: BaseModel](AbstractAgent):
             
             # Create CodeAgent with base parameters and additional kwargs
             print(self.tools)
+            print("MODEL "+20*"#"+"\n"+str(self.model)+"\n"+20*"#")
             self.agent = CodeAgent(
                 tools=self.tools,
                 model=self.model,

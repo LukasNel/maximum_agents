@@ -13,7 +13,7 @@ from smolagents import ActionStep, Tool
 
 from ..datastore.core import MaximumDataStore
 from ..datastore.types import SettingsT
-from ..base import HookRegistry
+from ..base import BaseAgent, HookRegistry
 from ..document_types import DocumentT, DocumentsT
 
 class DatabaseTool(Tool):
@@ -267,7 +267,7 @@ class AgentBuilder:
         return self
 
 
-    def build_agent(self, agent_class, *args, **kwargs):
+    def build_agent[T: BaseModel](self, *args, final_answer_model: type[T], final_answer_description: str, **kwargs):
         """
         Build and configure the agent with all added capabilities.
         
@@ -284,7 +284,7 @@ class AgentBuilder:
         kwargs['tools'] = kwargs.get('tools', []) + self.additional_tools
         kwargs['additional_authorized_imports'] = kwargs.get('additional_authorized_imports', []) + self.additional_imports
         # Create the agent
-        agent = agent_class(*args, **kwargs)
+        agent = BaseAgent[T](*args, final_answer_model=final_answer_model, final_answer_description=final_answer_description, **kwargs)
         
         return agent
     
