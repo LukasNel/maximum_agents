@@ -8,7 +8,7 @@ import uuid
 from PIL import Image
 from io import BytesIO
 from maximum_agents.records import ResultT
-from openai import BaseModel
+from pydantic import BaseModel
 from smolagents import ActionStep, Tool
 
 from ..datastore.core import MaximumDataStore

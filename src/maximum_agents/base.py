@@ -4,7 +4,7 @@ import json
 from smolagents.utils import extract_code_from_text
 from .pydantic_final_answer_tools import PydanticFinalAnswerTool
 from .abstract import AbstractAgent
-from typing import Callable, Any, List, Dict, Optional, cast
+from typing import Callable, Any, List, Dict, Optional, cast, Union
 from .records import  PartT, ResultT, BasicAnswerT, StepT, ThinkingPartT, CodePartT, OutputPartT, ToolCallT
 from smolagents import CodeAgent, Tool, LiteLLMModel, ChatMessage, ChatMessageStreamDelta, ToolCall
 from smolagents.agents import ToolOutput, ActionOutput
@@ -18,12 +18,15 @@ class NoFinalResultError(Exception):
 
 
 # Hook type definitions
+from typing import TypeVar
+T = TypeVar('T', bound=BaseModel)
+
 HookCallback = Callable[..., Any]
 PreRunHook = Callable[[str], str]  # Takes task, returns potentially modified task
-PostRunHook = Callable[[str, ResultT[BaseModel]], ResultT[BaseModel]]  # Takes task and result, returns potentially modified result
+PostRunHook = Callable[[str, ResultT[Any]], ResultT[Any]]  # Takes task and result, returns potentially modified result
 PreStepHook = Callable[[Any], Any]  # Takes step, returns potentially modified step
-PostStepHook = Callable[[Any, StepT | ResultT[BaseModel]], StepT | ResultT[BaseModel]]  # Takes original step and formatted step, returns potentially modified formatted step
-ErrorHook = Callable[[Exception, str], Optional[ResultT[BaseModel]]]  # Takes exception and task, returns optional result to continue or None to re-raise
+PostStepHook = Callable[[Any, StepT | ResultT[Any]], StepT | ResultT[Any]]  # Takes original step and formatted step, returns potentially modified formatted step
+ErrorHook = Callable[[Exception, str], Optional[ResultT[Any]]]  # Takes exception and task, returns optional result to continue or None to re-raise
 ModelSetupHook = Callable[[str], str]  # Takes model name, returns potentially modified model name
 ModelSelectionHook = Callable[[str], LiteLLMModel]  # Takes model name, returns instantiated model
 CodeAgentKwargsHook = Callable[[], Dict[str, Any]]  # Returns additional kwargs for CodeAgent constructor
@@ -247,7 +250,7 @@ class BaseAgent[T: BaseModel](AbstractAgent):
                     max_print_outputs_length: int = 50000,
                     final_answer_model: type[T] = BasicAnswerT,
                     final_answer_description: str = "The final answer to the user's question.",
-                    model: str="anthropic/claude-sonnet-4-20250514",
+                    model: Union[str, LiteLLMModel] = "anthropic/claude-sonnet-4-20250514",
                     model_kwargs: dict[str, Any] = {},
                     max_steps: int=35,
                     hook_registry: Optional[HookRegistry] = None,
@@ -262,12 +265,18 @@ class BaseAgent[T: BaseModel](AbstractAgent):
         self.max_steps = max_steps
         self.hooks = hook_registry or HookRegistry()  # Use provided registry or create new one
         self.agent : CodeAgent | None = None
-        # Set up default model selection hook if none exists
-        if not self.hooks.model_selection_hooks:
-            self.hooks.add_model_selection_hook(lambda model: default_model_selection_hook(model, model_kwargs))
+        
+        # Handle model setup - if model is already a LiteLLMModel instance, use it directly
+        if isinstance(model, LiteLLMModel):
+            self.model = model
+        else:
+            # Set up default model selection hook if none exists
+            if not self.hooks.model_selection_hooks:
+                self.hooks.add_model_selection_hook(lambda model: default_model_selection_hook(model, model_kwargs))
+            self.model = self._setup_model(model)
+        
         self.hooks.add_system_prompt_hook(self._add_task_to_system_prompt)
         self.hooks.add_system_prompt_hook(self._add_final_answer_description_to_system_prompt)
-        self.model = self._setup_model(model)
         self.final_answer_context = final_answer_context
         for hook in self.hooks.final_answer_context_hooks:
             self.final_answer_context = hook(self.final_answer_context)
@@ -301,7 +310,7 @@ class BaseAgent[T: BaseModel](AbstractAgent):
             return self.hooks.model_selection_hooks[-1](model)
         else:
             # Fallback to default behavior if no hooks are registered
-            return default_model_selection_hook(model)
+            return default_model_selection_hook(model, {})
  
     def _setup_system_prompt(self, task: str) -> str:
         # Apply system prompt hooks
